@@ -10,3 +10,7 @@ class SearchResponse(BaseModel):
 
     claims: list[Claim] = Field(default_factory=list)
     next_page_token: str = Field(alias="nextPageToken", default="")
+    fallback: bool = Field(
+        default=False,
+        description="Indica se o resultado provem do modelo local (True) ou da API externa (False).",
+    )

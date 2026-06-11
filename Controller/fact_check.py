@@ -1,5 +1,6 @@
-"""Fact-checking endpoints backed by an external API."""
+"""Fact-checking endpoints backed by an external API with local-model fallback."""
 
+import logging
 import os
 from typing import Any
 
@@ -8,9 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
 from starlette import status
 
+from Model.claim import Claim
 from Model.search_request import SearchRequest
 from Model.search_response import SearchResponse
+from Service.ml_fact_check import predict
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/fact-check", tags=["fact-check"])
 
@@ -74,12 +78,15 @@ def _raise_safe_upstream_error(*, status_code: int) -> None:
     )
 
 
-@router.get("/claims/search", response_model=SearchResponse)
-async def search_claims(request: SearchRequest = Depends()) -> SearchResponse:
-    """Search for fact-checked claims by a textual query."""
+async def _search_google_api(query: str) -> SearchResponse:
+    """Query the Google Fact Check Tools API and return parsed claims.
+
+    Raises HTTPException on any upstream failure (network, auth, parse, etc.)
+    so the caller can fall back to the local model.
+    """
 
     params = {
-        "query": request.query,
+        "query": query,
         "key": _get_api_key(),
     }
 
@@ -125,3 +132,40 @@ async def search_claims(request: SearchRequest = Depends()) -> SearchResponse:
         )
 
     return parsed
+
+
+async def _search_local_model(query: str) -> SearchResponse:
+    """Run the local ML model and return its prediction as a SearchResponse.
+
+    The fallback flag is set so consumers know the result came from the
+    trained model rather than the external API.
+    """
+
+    logger.info("Falling back to local model for query: %s", query)
+
+    result = await predict(query)
+    claim = Claim.model_validate(result)
+
+    return SearchResponse(claims=[claim], fallback=True)
+
+
+@router.get("/claims/search", response_model=SearchResponse)
+async def search_claims(request: SearchRequest = Depends()) -> SearchResponse:
+    """Search for fact-checked claims by a textual query.
+
+    Attempts the Google Fact Check Tools API first. If the external
+    service is unreachable, returns an error, or finds no claims, the
+    endpoint falls back to the locally trained ML model and indicates
+    the fallback via the response payload.
+    """
+
+    try:
+        return await _search_google_api(request.query)
+    except HTTPException as exc:
+        logger.warning(
+            "Google API unavailable (status=%s), using local model fallback. "
+            "query=%r",
+            exc.status_code,
+            request.query,
+        )
+        return await _search_local_model(request.query)
